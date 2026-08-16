@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect, useCallback } from "react";
+import React, { useState, useRef, useEffect, useCallback, useMemo } from "react";
 
 // Anthropic 비전은 긴 변 1568px를 넘으면 서버에서 다시 줄인다.
 // 그 경계에 맞춰 보내야 글자가 가장 또렷하게 전달된다.
@@ -339,30 +339,172 @@ function writeLedger(list) {
 
 /* ---------- 수식 렌더 ---------- */
 
-function Tex({ children, className }) {
-  const ref = useRef(null);
-  useEffect(() => {
-    if (ref.current && window.renderMathInElement) {
+// 모델이 @@MATH 칸에 달러 없이 날 LaTeX만 적어 보내는 일이 잦다.
+//   예: -f(g(1))=f(1)\Rightarrow f(1)=0,\quad f' \text{연속} \Rightarrow f'(1)=0
+// 이런 줄은 구분자가 없어 그대로 글자로 새어 나온다.
+// 그래서 렌더 직전에 "수식으로 보이는 구간"을 찾아 달러로 감싸준다.
+
+const HANGUL = /[\uAC00-\uD7A3\u3131-\u318E]/;
+const HANGUL_RUN = new RegExp(
+  "([\\uAC00-\\uD7A3\\u3131-\\u318E]+(?:[ \\t]+[\\uAC00-\\uD7A3\\u3131-\\u318E]+)*)"
+);
+
+// 한글이 섞여 있어도 \text{연속} 처럼 LaTeX 명령 안에 있는 것은 수식의 일부다.
+const PROTECT = /\\(?:text|textrm|textbf|textit|mathrm|mathbf|operatorname)\s*\{[^{}]*\}/g;
+
+function looksLikeMath(s) {
+  if (!s || !s.trim()) return false;
+  if (/\\[a-zA-Z]/.test(s)) return true; // \frac \to \Rightarrow \quad
+  if (/[\^_]/.test(s)) return true; // 지수·첨자
+  if (/[=<>≤≥≠±×÷∞→]/.test(s)) return true;
+  if (/[a-zA-Z]\s*\(/.test(s)) return true; // f(x), g(1)
+  if (/\d\s*[+\-*/]\s*\d/.test(s)) return true;
+  return false;
+}
+
+function wrapLine(line, preferDisplay) {
+  if (!line.trim()) return line;
+
+  // "- " 같은 글머리 기호는 수식 밖에 둔다 (앞의 마이너스 부호와 구별)
+  const bullet = line.match(/^(\s*[-•*·]\s+)/);
+  const head = bullet ? bullet[1] : "";
+  let body = line.slice(head.length);
+
+  // \text{...} 를 잠시 치워둔다 (안의 한글 때문에 잘리면 안 된다)
+  const stash = [];
+  body = body.replace(PROTECT, (m) => {
+    stash.push(m);
+    return `\u0001${stash.length - 1}\u0001`;
+  });
+
+  const parts = body.split(HANGUL_RUN);
+  let mathRuns = 0;
+  let proseChars = 0;
+
+  const joined = parts
+    .map((p) => {
+      if (!p) return "";
+      if (HANGUL.test(p)) {
+        proseChars += p.trim().length;
+        return p;
+      }
+      if (!looksLikeMath(p)) return p;
+      // 앞뒤 공백과 끝의 문장부호는 수식 밖으로 뺀다
+      const m = p.match(/^(\s*)([\s\S]*?)([\s,.;]*)$/);
+      const inner = m[2];
+      if (!inner) return p;
+      mathRuns += 1;
+      return `${m[1]}$${inner}$${m[3]}`;
+    })
+    .join("");
+
+  let out = head + joined;
+
+  // 줄 전체가 수식 하나면 디스플레이 수식으로 크게 보여준다
+  if (preferDisplay && mathRuns === 1 && proseChars === 0 && !head) {
+    out = out.replace(/^(\s*)\$([\s\S]*)\$([\s,.;]*)$/, "$1$$$$$2$$$$$3");
+  }
+
+  return out.replace(/\u0001(\d+)\u0001/g, (_, i) => stash[Number(i)]);
+}
+
+function autoWrapMath(raw, preferDisplay) {
+  const s = String(raw ?? "");
+  if (!s) return s;
+  // 이미 구분자가 있으면 모델 의도를 존중하고 손대지 않는다
+  if (s.includes("$") || s.includes("\\(") || s.includes("\\[")) return s;
+  return s
+    .split(/\r?\n/)
+    .map((l) => wrapLine(l, preferDisplay))
+    .join("\n");
+}
+
+function escapeHtml(s) {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+const DELIMS = [
+  { l: "$$", r: "$$", display: true },
+  { l: "\\[", r: "\\]", display: true },
+  { l: "\\(", r: "\\)", display: false },
+  { l: "$", r: "$", display: false },
+];
+
+// auto-render.js 는 React가 관리하는 DOM을 직접 뜯어고쳐서
+// 리렌더가 한 번 일어나면 렌더 결과가 날아간다.
+// 직접 문자열로 만들어 한 번에 넣으면 그런 충돌이 없다.
+function texToHtml(src) {
+  const katex = window.katex;
+  const s = String(src ?? "");
+  if (!katex) return escapeHtml(s).replace(/\n/g, "<br/>");
+
+  let out = "";
+  let i = 0;
+  while (i < s.length) {
+    let hit = null;
+    for (const d of DELIMS) {
+      if (!s.startsWith(d.l, i)) continue;
+      const end = s.indexOf(d.r, i + d.l.length);
+      if (end === -1) continue;
+      hit = { d, end };
+      break;
+    }
+    if (hit) {
+      const body = s.slice(i + hit.d.l.length, hit.end);
       try {
-        window.renderMathInElement(ref.current, {
-          delimiters: [
-            { left: "$$", right: "$$", display: true },
-            { left: "$", right: "$", display: false },
-            { left: "\\(", right: "\\)", display: false },
-            { left: "\\[", right: "\\]", display: true },
-          ],
+        out += katex.renderToString(body, {
+          displayMode: hit.d.display,
           throwOnError: false,
+          strict: false,
+          trust: false,
         });
       } catch (e) {
-        /* 수식이 깨져도 원문은 남는다 */
+        // 깨진 수식은 원문 그대로 보여준다 (빈칸으로 사라지는 것보다 낫다)
+        out += `<span class="tex-raw">${escapeHtml(body)}</span>`;
       }
+      i = hit.end + hit.d.r.length;
+    } else {
+      const ch = s[i];
+      out += ch === "\n" ? "<br/>" : escapeHtml(ch);
+      i += 1;
     }
-  }, [children]);
-  return (
-    <div ref={ref} className={className}>
-      {children}
-    </div>
-  );
+  }
+  return out;
+}
+
+// katex.min.js 는 defer 로 늦게 붙는다.
+// 첫 렌더 때 window.katex 가 없으면 예전 코드는 그냥 포기해 버렸다.
+function useKatexReady() {
+  const [ready, setReady] = useState(() => typeof window !== "undefined" && Boolean(window.katex));
+  useEffect(() => {
+    if (ready) return undefined;
+    let alive = true;
+    const timer = setInterval(() => {
+      if (window.katex && alive) {
+        setReady(true);
+        clearInterval(timer);
+      }
+    }, 40);
+    const giveUp = setTimeout(() => clearInterval(timer), 10000);
+    return () => {
+      alive = false;
+      clearInterval(timer);
+      clearTimeout(giveUp);
+    };
+  }, [ready]);
+  return ready;
+}
+
+function Tex({ children, className, as: Tag = "div", display = false }) {
+  const ready = useKatexReady();
+  const src = typeof children === "string" ? children : String(children ?? "");
+  const html = useMemo(() => {
+    if (!ready || !src) return "";
+    return texToHtml(autoWrapMath(src, display));
+  }, [ready, src, display]);
+
+  if (!ready || !src) return <Tag className={className}>{src}</Tag>;
+  return <Tag className={className} dangerouslySetInnerHTML={{ __html: html }} />;
 }
 
 /* ---------- 영역 자르기 ---------- */
@@ -746,7 +888,7 @@ export default function App() {
           <section className="result">
             <div className="meta-rule">{solution.topic || "풀이"}</div>
             <Tex className="insight">{solution.insight}</Tex>
-            <p className="problem-line">{solution.problem}</p>
+            <Tex as="p" className="problem-line">{solution.problem}</Tex>
 
             <div className="flight">
               {(solution.steps || []).map((s, i) => (
@@ -756,9 +898,9 @@ export default function App() {
                   style={{ marginLeft: `min(${i * 10}px, 5vw)`, animationDelay: `${0.12 + i * 0.07}s` }}
                 >
                   <div className="tread-num">{i + 1}</div>
-                  <p className="tread-do">{s.do}</p>
-                  {s.math ? <Tex className="tread-math">{s.math}</Tex> : null}
-                  {s.why ? <p className="tread-why">{s.why}</p> : null}
+                  <Tex as="p" className="tread-do">{s.do}</Tex>
+                  {s.math ? <Tex className="tread-math" display>{s.math}</Tex> : null}
+                  {s.why ? <Tex as="p" className="tread-why">{s.why}</Tex> : null}
                 </div>
               ))}
             </div>
@@ -781,13 +923,13 @@ export default function App() {
                 {solution.trap && (
                   <div className="aside">
                     <div className="aside-label">자주 하는 실수</div>
-                    <p className="aside-text">{solution.trap}</p>
+                    <Tex as="p" className="aside-text">{solution.trap}</Tex>
                   </div>
                 )}
                 {solution.slower && (
                   <div className="aside">
                     <div className="aside-label">정석이 느린 이유</div>
-                    <p className="aside-text">{solution.slower}</p>
+                    <Tex as="p" className="aside-text">{solution.slower}</Tex>
                   </div>
                 )}
               </div>
@@ -812,7 +954,7 @@ export default function App() {
                         const desc = bar === -1 ? "" : line.slice(bar + 1).trim();
                         return (
                           <div className="need" key={i}>
-                            <div className="need-name">{name}</div>
+                            <Tex className="need-name">{name}</Tex>
                             {desc && <Tex className="need-desc">{desc}</Tex>}
                           </div>
                         );
