@@ -12,16 +12,32 @@ const LEDGER_LIMIT = 20;
 // (\\lim 은 파싱 실패, \\to 는 탭 문자로 변질된다)
 function parseBlocks(raw) {
   const lines = String(raw || "").split(/\r?\n/);
-  const out = { steps: [] };
+  const out = { steps: [], concepts: [] };
   let key = null;
   let buf = [];
   let step = null;
+  let concept = null;
+
+  const STEP_KEYS = new Set(["DO", "MATH", "WHY"]);
+  const CONCEPT_KEYS = new Set([
+    "CNAME",
+    "CLEVEL",
+    "CPRE",
+    "CIDEA",
+    "CDEF",
+    "CWHY",
+    "CPROP",
+    "CCARE",
+    "CEX",
+  ]);
 
   const flush = () => {
     if (!key) return;
     const value = buf.join("\n").trim();
-    if (key === "DO" || key === "MATH" || key === "WHY") {
-      if (step) step[key.toLowerCase()] = value;
+    if (STEP_KEYS.has(key) && step) {
+      step[key.toLowerCase()] = value;
+    } else if (CONCEPT_KEYS.has(key) && concept) {
+      concept[key.toLowerCase()] = value;
     } else {
       out[key.toLowerCase()] = value;
     }
@@ -37,6 +53,20 @@ function parseBlocks(raw) {
         step = { do: "", math: "", why: "" };
         out.steps.push(step);
         key = null;
+      } else if (k === "CONCEPT") {
+        concept = {
+          cname: "",
+          clevel: "",
+          cpre: "",
+          cidea: "",
+          cdef: "",
+          cwhy: "",
+          cprop: "",
+          ccare: "",
+          cex: "",
+        };
+        out.concepts.push(concept);
+        key = null;
       } else if (k === "END") {
         key = null;
         break;
@@ -50,7 +80,24 @@ function parseBlocks(raw) {
   flush();
 
   out.steps = out.steps.filter((st) => st.do || st.math);
+  out.concepts = out.concepts.filter((c) => c.cname);
   return out;
+}
+
+// "이름|설명" 줄 묶음을 파싱한다 (CPROP, TERM, ADVNEED 공용)
+function parsePairs(raw) {
+  return String(raw || "")
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean)
+    .map((line) => {
+      const bar = line.indexOf("|");
+      if (bar === -1) return { name: line.replace(/^[-•*·]\s*/, ""), desc: "" };
+      return {
+        name: line.slice(0, bar).trim().replace(/^[-•*·]\s*/, ""),
+        desc: line.slice(bar + 1).trim(),
+      };
+    });
 }
 
 /* ---------- 이미지 처리 ---------- */
@@ -507,6 +554,95 @@ function Tex({ children, className, as: Tag = "div", display = false }) {
   return <Tag className={className} dangerouslySetInnerHTML={{ __html: html }} />;
 }
 
+/* ---------- 상위 과정 개념 해부 ---------- */
+
+// 개념 하나를 직관 -> 정의 -> 왜 -> 성질 -> 함정 -> 예 순서로 쌓아 보여준다.
+// 이 순서는 프롬프트가 생성하는 순서와 같아야 한다. 학생이 읽는 순서이기도 하다.
+function ConceptCard({ concept, index }) {
+  const [open, setOpen] = useState(index === 0); // 첫 개념은 펴 둔다
+  const props = parsePairs(concept.cprop);
+
+  return (
+    <article className={`concept ${open ? "is-open" : ""}`}>
+      <button
+        type="button"
+        className="concept-head"
+        onClick={() => setOpen((v) => !v)}
+        aria-expanded={open}
+      >
+        <span className="concept-index">{String(index + 1).padStart(2, "0")}</span>
+        <span className="concept-heading">
+          <Tex as="span" className="concept-name">{concept.cname}</Tex>
+          {concept.clevel && <span className="concept-level">{concept.clevel}</span>}
+        </span>
+        <span className="concept-chevron" aria-hidden="true">
+          {open ? "−" : "+"}
+        </span>
+      </button>
+
+      {open && (
+        <div className="concept-body">
+          {concept.cpre && (
+            <div className="concept-pre">
+              <span className="concept-pre-label">출발점</span>
+              <Tex as="span" className="concept-pre-text">{concept.cpre}</Tex>
+            </div>
+          )}
+
+          {concept.cidea && (
+            <div className="concept-row concept-idea">
+              <div className="concept-row-label">한마디로</div>
+              <Tex className="concept-row-text">{concept.cidea}</Tex>
+            </div>
+          )}
+
+          {concept.cdef && (
+            <div className="concept-row concept-def">
+              <div className="concept-row-label">정확한 정의</div>
+              <Tex className="concept-row-text">{concept.cdef}</Tex>
+            </div>
+          )}
+
+          {concept.cwhy && (
+            <div className="concept-row">
+              <div className="concept-row-label">왜 이런 정의인가</div>
+              <Tex className="concept-row-text">{concept.cwhy}</Tex>
+            </div>
+          )}
+
+          {props.length > 0 && (
+            <div className="concept-row">
+              <div className="concept-row-label">성질</div>
+              <ul className="prop-list">
+                {props.map((pr, i) => (
+                  <li className="prop" key={i}>
+                    <Tex as="span" className="prop-name">{pr.name}</Tex>
+                    {pr.desc && <Tex as="span" className="prop-desc">{pr.desc}</Tex>}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          {concept.ccare && (
+            <div className="concept-row concept-care">
+              <div className="concept-row-label">조건을 어기면</div>
+              <Tex className="concept-row-text">{concept.ccare}</Tex>
+            </div>
+          )}
+
+          {concept.cex && (
+            <div className="concept-row concept-ex">
+              <div className="concept-row-label">쉬운 예로 굴려보기</div>
+              <Tex className="concept-row-text">{concept.cex}</Tex>
+            </div>
+          )}
+        </div>
+      )}
+    </article>
+  );
+}
+
 /* ---------- 영역 자르기 ---------- */
 
 function CropStage({ dataUrl, crop, onChange }) {
@@ -940,33 +1076,55 @@ export default function App() {
                 <div className="extra-head">
                   <span className="extra-tag">상위 교육과정</span>
                   <h3 className="extra-title">{solution.advtitle}</h3>
+                  {solution.advgap && <Tex className="extra-gap">{solution.advgap}</Tex>}
                 </div>
 
-                {solution.advneed && (
-                  <div className="need-list">
-                    {solution.advneed
-                      .split(/\r?\n/)
-                      .map((l) => l.trim())
-                      .filter(Boolean)
-                      .map((line, i) => {
-                        const bar = line.indexOf("|");
-                        const name = bar === -1 ? line : line.slice(0, bar).trim();
-                        const desc = bar === -1 ? "" : line.slice(bar + 1).trim();
-                        return (
-                          <div className="need" key={i}>
-                            <Tex className="need-name">{name}</Tex>
-                            {desc && <Tex className="need-desc">{desc}</Tex>}
-                          </div>
-                        );
-                      })}
+                {(solution.concepts || []).length > 0 && (
+                  <div className="concepts">
+                    <div className="concept-lead">
+                      <span className="concept-lead-num">
+                        {String(solution.concepts.length).padStart(2, "0")}
+                      </span>
+                      <span className="concept-lead-text">
+                        아래 풀이를 읽기 전에 필요한 개념입니다. 처음 본다는 전제로 썼습니다.
+                      </span>
+                    </div>
+                    {solution.concepts.map((c, i) => (
+                      <ConceptCard key={i} concept={c} index={i} />
+                    ))}
                   </div>
                 )}
 
-                <Tex className="extra-body">{solution.advbody}</Tex>
+                <div className="advbody-block">
+                  <div className="aside-label">이 도구로 문제를 푼다</div>
+                  <Tex className="extra-body">{solution.advbody}</Tex>
+                </div>
+
                 {solution.advwhy && (
                   <div className="extra-why">
                     <div className="aside-label">고교 풀이와의 연결</div>
                     <Tex className="extra-why-text">{solution.advwhy}</Tex>
+                  </div>
+                )}
+
+                {solution.advmore && (
+                  <div className="extra-more">
+                    <div className="aside-label">이 도구를 알면 또 풀리는 것</div>
+                    <Tex className="extra-why-text">{solution.advmore}</Tex>
+                  </div>
+                )}
+
+                {solution.term && parsePairs(solution.term).length > 0 && (
+                  <div className="glossary">
+                    <div className="aside-label">용어 사전 — 교육과정 밖 표현</div>
+                    <dl className="glossary-list">
+                      {parsePairs(solution.term).map((t, i) => (
+                        <div className="glossary-row" key={i}>
+                          <Tex as="dt" className="glossary-term">{t.name}</Tex>
+                          <Tex as="dd" className="glossary-def">{t.desc}</Tex>
+                        </div>
+                      ))}
+                    </dl>
                   </div>
                 )}
               </section>
